@@ -207,7 +207,7 @@ fn do_output(out: [bandersnatch_vrfs::VrfInOut; 1]) -> Alias {
 
 impl<KZG: Web3SumKZG> VerifiableUniqueAlias for BandersnatchRingVRF<KZG> {
 
-//	fn unverified_alias(&self) -> Alias {
+//	fn unverified_alias(&self, context: &[u8]) -> Alias {
 //		self.0.preoutputs[0]
 //	}
 
@@ -363,7 +363,9 @@ mod tests {
 		let opening = BRVRF::open_members(&me,ring.iter()).unwrap();
 		let (signature,alias1) = BRVRF::create(opening,&secret,&context,&message).unwrap();
 
-        // TODO: serialize signature
+        // Serialize+Deserialize
+		let signature = signature.encode();
+		let signature = BRVRF::decode(&mut signature.as_slice()).unwrap();
 
         // Verify
 		let mut inter = BRVRF::start_members();
