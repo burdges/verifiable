@@ -175,9 +175,6 @@ pub trait Web3SumKZG: 'static {
 		static CELL: OnceLock<ring::KZG> = OnceLock::new();
 		CELL.get_or_init(|| {
 			<ring::KZG as CanonicalDeserialize>::deserialize_compressed(Self::kzg_bytes()).unwrap()
-			// let domain_size = 2u32.pow(10);
-			// let seed = [5u8; 32];
-			// ring::KZG::insecure_kzg_setup(seed, domain_size, &mut rand_core::OsRng)
 		})
 	}
 }
@@ -267,7 +264,7 @@ impl<KZG: Web3SumKZG> VerifiableUniqueAlias for BandersnatchRingVRF<KZG> {
 		Self::Member: 'a,
 	{
 		let max_len: u32 = KZG::kzg().max_keyset_size().try_into().expect("Impossibly large a KZG, qed");
-		let i = 0u32;
+		let mut i = 0u32;
 		let mut me = u32::MAX;
 		// #![feature(iterator_try_collect)]
 		let mut pks = Vec::with_capacity(members.size_hint().0);
@@ -275,6 +272,7 @@ impl<KZG: Web3SumKZG> VerifiableUniqueAlias for BandersnatchRingVRF<KZG> {
             if i >= max_len { return Err(()); }
 			if myself == member { me = i }
 			pks.push(PublicKey::deserialize(&member[..]).map_err(|_| ())?.0.0);
+			i += 1;
 		}
 		if me == u32::MAX { return Err(()); }
 		Ok(( me, ArkScale(KZG::kzg().prover_key(pks)) ))
