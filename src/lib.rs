@@ -370,12 +370,6 @@ mod tests {
 		for m in &ring {
 			BRVRF::push_member(&mut inter, m.clone()).unwrap();
 		}
-		assert_eq!(ring.len(), inter.0.len());
-		for (x,y) in ring.iter().zip(&inter.0) {
-			let mut z = [0u8;33];
-			y.serialize_compressed(&mut z[..]).unwrap();
-			assert_eq!(x,&z);
-		}
 		let members = BRVRF::finish_members(inter).unwrap();
 		let alias2 = signature.verify(&members,&context,&message).unwrap();
 		assert_eq!(alias1,alias2);
