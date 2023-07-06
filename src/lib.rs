@@ -1,8 +1,14 @@
-use core::fmt::Debug;
+use core::{
+	fmt::Debug,
+	marker::PhantomData,
+};
 use parity_scale_codec::{Decode, Encode, FullCodec, MaxEncodedLen};
 use scale_info::*;
 use ark_scale::ArkScale;
-use bandersnatch_vrfs::{ SecretKey, PublicKey, RingVrfSignature };
+use bandersnatch_vrfs::{
+	SecretKey, PublicKey, RingVrfSignature, ring,
+	CanonicalSerialize,CanonicalDeserialize,SerializationError, // ark_serialize::
+};
 use std::vec::Vec;
 
 // Fixed types:
@@ -56,19 +62,15 @@ pub trait VerifiableUniqueAlias: Sized
 
     // Ring management
 
-    /// Trusted setup.
-	/// TODO: Instantiated from an `include_bytes!` but then deserialized, probably.
-    type TrustedSetup; // Decode
-
 	/// Intermediate value while building a `Self::Members` value. Probably just an unfinished Ring
 	/// Root(?)
 	type Intermediate; // Clone + PartialEq + FullCodec;
 
 	/// Begin building a `Members` value.
-	fn start_members(ts: &Self::TrustedSetup) -> Self::Intermediate;
+	fn start_members() -> Self::Intermediate;
 
 	/// Introduce a new `Member` into the intermediate value used to build a new `Members` value.
-	fn push_member(ts: &Self::TrustedSetup, intermediate: &mut Self::Intermediate, who: Self::Member) -> Result<(),()>;
+	fn push_member(intermediate: &mut Self::Intermediate, who: Self::Member) -> Result<(),()>;
 
     /*
     Interface ideas:
@@ -84,7 +86,6 @@ pub trait VerifiableUniqueAlias: Sized
 
     /// If old.len() < new.len() then we pad old by the padding point.
 	fn update_members(
-		ts: &Self::TrustedSetup,
 		intermediate: &mut Self::Members,
 		start: u32,
 		old: &[Self::Member],
@@ -107,14 +108,13 @@ pub trait VerifiableUniqueAlias: Sized
 	type Members; // : Clone + PartialEq + FullCodec;
 
 	/// Consume the `intermediate` value to create a new `Members` value.
-	fn finish_members(ts: &Self::TrustedSetup, inter: Self::Intermediate) -> Result<Self::Members, ()>;
+	fn finish_members(inter: Self::Intermediate) -> Result<Self::Members, ()>;
 
 	/// Check whether `self` is a valid proof of membership in `members` in the given `context`;
 	/// if so, ensure that the member is necessarily associated with `alias` in this `context` and
 	/// that they elected to opine `message`.
 	fn verify(
 		&self,
-		ts: &Self::TrustedSetup,
 		members: &Self::Members,
 		context: &[u8],
 		message: &[u8],
@@ -136,7 +136,6 @@ pub trait VerifiableUniqueAlias: Sized
 	///
 	/// NOTE: We never expect to use this code on-chain; it should be used only in the wallet.
 	fn open_members<'a>(
-		ts: &Self::TrustedSetup,
 		member: &Self::Member,
 		members_iter: impl Iterator<Item = &'a Self::Member>,
 	) -> Result<Self::Opening, ()> where Self::Member: 'a;
@@ -154,7 +153,6 @@ pub trait VerifiableUniqueAlias: Sized
 	///
 	/// NOTE: We never expect to use this code on-chain; it should be used only in the wallet.
 	fn create(
-		ts: &Self::TrustedSetup,
 		opening: Self::Opening,
 		secret: &Self::Secret,
 		context: &[u8],
@@ -163,10 +161,32 @@ pub trait VerifiableUniqueAlias: Sized
 }
 
 
+// A hack that moves the .
+pub trait Web3SumKZG: 'static {
+	fn kzg_bytes() -> &'static [u8];
+	fn kzg() -> &'static ring::KZG {
+		// TODO: Find a no_std analog.  Check it supports multiple setups.
+		use std::sync::OnceLock;
+		static CELL: OnceLock<ring::KZG> = OnceLock::new();
+		CELL.get_or_init(|| {
+			<ring::KZG as CanonicalDeserialize>::deserialize_compressed(Self::kzg_bytes()).unwrap()
+		})
+	}
+}
 
+pub struct Test2e10;
+
+impl Web3SumKZG for Test2e10 {
+	fn kzg_bytes() -> &'static [u8] {
+		include_bytes!("testing.kzg")
+	}
+}
 
 #[derive(Encode, Decode)] // Clone, Eq, PartialEq, , Debug, TypeInfo, MaxEncodedLen
-pub struct BandersnatchRingVRF(ArkScale<RingVrfSignature<1>>);
+pub struct BandersnatchRingVRF<KZG: Web3SumKZG>(
+	ArkScale<RingVrfSignature<1>>,
+	PhantomData<fn() -> &'static KZG>
+);
 
 fn do_input(context: &[u8]) -> bandersnatch_vrfs::VrfInput {
 	use bandersnatch_vrfs::IntoVrfInput;
@@ -178,9 +198,9 @@ fn do_input(context: &[u8]) -> bandersnatch_vrfs::VrfInput {
 
 fn do_output(out: [bandersnatch_vrfs::VrfInOut; 1]) -> Alias {
 	out[0].vrf_output_bytes(b"Polkadot Fellowship Alias : Output")
-}
+} 
 
-impl VerifiableUniqueAlias for BandersnatchRingVRF {
+impl<KZG: Web3SumKZG> VerifiableUniqueAlias for BandersnatchRingVRF<KZG> {
 
 //	fn unverified_alias(&self) -> Alias {
 //		self.0.preoutputs[0]
@@ -193,41 +213,37 @@ impl VerifiableUniqueAlias for BandersnatchRingVRF {
 		SecretKey::from_seed(entropy)
 	}
 	fn member_from_secret(secret: &Self::Secret) -> Self::Member {
-		secret.to_public().serialize().unwrap()
+		secret.to_public().serialize()
 	}
-
-    /// TODO: Needs deserialization.
-    type TrustedSetup = bandersnatch_vrfs::ring::KZG;
 
 	/// TODO: 
 	type Intermediate = ArkScale<Vec<bandersnatch_vrfs::bandersnatch::SWAffine>>;
 
 	type Members = ArkScale<bandersnatch_vrfs::ring::VerifierKey>;
 
-	fn start_members(kzg: &Self::TrustedSetup) -> Self::Intermediate {
-		ArkScale(Vec::with_capacity( kzg.max_keyset_size() ))
+	fn start_members() -> Self::Intermediate {
+		ArkScale(Vec::with_capacity( KZG::kzg().max_keyset_size() ))
 	}
-	fn push_member(_kzg: &Self::TrustedSetup, inter: &mut Self::Intermediate, who: Self::Member) -> Result<(),()> {
+	fn push_member(inter: &mut Self::Intermediate, who: Self::Member) -> Result<(),()> {
 		let pk = PublicKey::deserialize(&who[..]).map_err(|_| ()) ?;
 		inter.0.push(pk.0.0);
 		Ok(())
 	}
-	fn finish_members(kzg: &Self::TrustedSetup, inter: Self::Intermediate) -> Result<Self::Members,()> {
-		if inter.0.len() >= kzg.max_keyset_size() { return Err(()); }
+	fn finish_members(inter: Self::Intermediate) -> Result<Self::Members,()> {
+		if inter.0.len() >= KZG::kzg().max_keyset_size() { return Err(()); }
         // In theory, our ring-prover should pad the KZG but sergey has blatantly
 		// insecure padding right now:
 		// https://github.com/w3f/ring-proof/blob/master/ring/src/piop/params.rs#L56
-        Ok(ArkScale(kzg.verifier_key(inter.0)))
+        Ok(ArkScale(KZG::kzg().verifier_key(inter.0)))
 	}
 
 	fn verify(
 		&self,
-		kzg: &Self::TrustedSetup,
 		members: &Self::Members,
 		context: &[u8],
 		message: &[u8],
 	) -> Result<Alias, ()> {
-        let ring_verifier = kzg.init_ring_verifier(members.0.clone());
+        let ring_verifier = KZG::kzg().init_ring_verifier(members.0.clone());
  		self.0.0.verify_ring_vrf(message, core::iter::once(do_input(context)), &ring_verifier)
 		.map(do_output).map_err(|_| ())
 	}
@@ -236,14 +252,13 @@ impl VerifiableUniqueAlias for BandersnatchRingVRF {
 	type Opening = (u32, ArkScale<bandersnatch_vrfs::ring::ProverKey>);
 
 	fn open_members<'a>(
-		kzg: &Self::TrustedSetup,
 		myself: &Self::Member,
 		members: impl Iterator<Item = &'a Self::Member>,
 	) -> Result<Self::Opening, ()>
 	where
 		Self::Member: 'a,
 	{
-		let max_len: u32 = kzg.max_keyset_size().try_into().expect("Impossibly large a KZG, qed");
+		let max_len: u32 = KZG::kzg().max_keyset_size().try_into().expect("Impossibly large a KZG, qed");
 		let i = 0u32;
 		let mut me = u32::MAX;
 		// #![feature(iterator_try_collect)]
@@ -254,27 +269,51 @@ impl VerifiableUniqueAlias for BandersnatchRingVRF {
 			pks.push(PublicKey::deserialize(&member[..]).map_err(|_| ())?.0.0);
 		}
 		if me == u32::MAX { return Err(()); }
-		Ok(( me, ArkScale(kzg.prover_key(pks)) ))
+		Ok(( me, ArkScale(KZG::kzg().prover_key(pks)) ))
 	}
 
 	fn create(
-		kzg: &Self::TrustedSetup,
 		(me, members): Self::Opening,
 		secret: &Self::Secret,
 		context: &[u8],
 		message: &[u8],
 	) -> Result<(Self, Alias), ()> {
-		assert!((me as usize) < kzg.max_keyset_size());
+		assert!((me as usize) < KZG::kzg().max_keyset_size());
 		let io: [_; 1] = [secret.0.vrf_inout(do_input(context))];
-        let ring_prover = kzg.init_ring_prover(members.0, me as usize);
+        let ring_prover = KZG::kzg().init_ring_prover(members.0, me as usize);
         let signature: RingVrfSignature<1> = secret.sign_ring_vrf(message, &io, &ring_prover);
-        Ok(( BandersnatchRingVRF(ArkScale(signature)), do_output(io) ))
+        Ok(( BandersnatchRingVRF(ArkScale(signature),PhantomData), do_output(io) ))
 	}
 }
 
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::iter;
 
+    #[test]
+	fn create_trusted_setup() {
+		let domain_size = 2u32.pow(10);
 
+		let mut rng = &mut rand_core::OsRng;
+		use rand_core::RngCore;
+		let mut seed = [0u8;32];
+		rng.fill_bytes(&mut seed);
+
+		let kzg = ring::KZG::insecure_kzg_setup(seed, domain_size, rng);
+
+		use std::fs::File;
+		use std::io::prelude::*;
+		let path = std::path::Path::new("fresh.kzg");
+		let mut file = File::create(&path).unwrap_or_else(|why| {
+			panic!("couldn't create {}: {}", path.display(), why);
+		});
+		kzg.serialize_compressed(&mut file).unwrap_or_else(|why| {
+			panic!("couldn't write {}: {}", path.display(), why);
+		});
+	}
+}
 
 
 
