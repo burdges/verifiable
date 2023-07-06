@@ -79,12 +79,15 @@ pub trait VerifiableUniqueAlias: Sized
 
     #1. Add one by one, but use full list in opening (Gav)
 
-	#2. Edit by range and open by index.  We supply the old members so they can be
-	    removed from the KZG, but does this work with our Fiat-Shamir?  Yes of course.
-		This requires retaining more metadata, and doing so correctly, but it fits
-		nicer with on-chain proofs.
+	#2. Edit by index or range, but open by index.  In editing, our user supplies the
+	    old members so they can be removed from the KZG, but does this work with our
+		Fiat-Shamir?  Yes of course.  This requires retaining more metadata though,
+		and doing so correctly, but it fits nicer with on-chain proofs.
 
-    /// If old.len() < new.len() then we pad old by the padding point.
+    /// If `old.len() < new.len()` then we assume old is padded by the padding point.
+	/// If `new.len() < old.len()` then reinsert the padding point into the gap.
+	/// In effect, old and new both have length `max(old.len(), new.len())`, with
+	/// any unspecified points given by the padding point.
 	fn update_members(
 		intermediate: &mut Self::Members,
 		start: u32,
@@ -97,6 +100,8 @@ pub trait VerifiableUniqueAlias: Sized
 		cannot be embedded alongside other account data.
  
 	Ideally, we'd should keep the prover and verifier interfaces similar.
+
+	Sergey TODO: What do you think of interface #2?
 
 	I'm going with #0 for now just to get something done, as doing anything more
 	complex right now feels like a distraction.
@@ -170,6 +175,9 @@ pub trait Web3SumKZG: 'static {
 		static CELL: OnceLock<ring::KZG> = OnceLock::new();
 		CELL.get_or_init(|| {
 			<ring::KZG as CanonicalDeserialize>::deserialize_compressed(Self::kzg_bytes()).unwrap()
+			// let domain_size = 2u32.pow(10);
+			// let seed = [5u8; 32];
+			// ring::KZG::insecure_kzg_setup(seed, domain_size, &mut rand_core::OsRng)
 		})
 	}
 }
@@ -207,7 +215,7 @@ impl<KZG: Web3SumKZG> VerifiableUniqueAlias for BandersnatchRingVRF<KZG> {
 //	}
 
 	type Secret = SecretKey;
-	type Member = [u8; 32];
+	type Member = [u8; 33];
 
 	fn new_secret(entropy: &Entropy) -> Self::Secret {
 		SecretKey::from_seed(entropy)
@@ -216,7 +224,7 @@ impl<KZG: Web3SumKZG> VerifiableUniqueAlias for BandersnatchRingVRF<KZG> {
 		secret.to_public().serialize()
 	}
 
-	/// TODO: 
+	/// TODO: Interface #2 would make this sane.
 	type Intermediate = ArkScale<Vec<bandersnatch_vrfs::bandersnatch::SWAffine>>;
 
 	type Members = ArkScale<bandersnatch_vrfs::ring::VerifierKey>;
@@ -230,7 +238,7 @@ impl<KZG: Web3SumKZG> VerifiableUniqueAlias for BandersnatchRingVRF<KZG> {
 		Ok(())
 	}
 	fn finish_members(inter: Self::Intermediate) -> Result<Self::Members,()> {
-		if inter.0.len() >= KZG::kzg().max_keyset_size() { return Err(()); }
+		if inter.0.len() > KZG::kzg().max_keyset_size() { return Err(()); }
         // In theory, our ring-prover should pad the KZG but sergey has blatantly
 		// insecure padding right now:
 		// https://github.com/w3f/ring-proof/blob/master/ring/src/piop/params.rs#L56
@@ -245,7 +253,7 @@ impl<KZG: Web3SumKZG> VerifiableUniqueAlias for BandersnatchRingVRF<KZG> {
 	) -> Result<Alias, ()> {
         let ring_verifier = KZG::kzg().init_ring_verifier(members.0.clone());
  		self.0.0.verify_ring_vrf(message, core::iter::once(do_input(context)), &ring_verifier)
-		.map(do_output).map_err(|_| ())
+		.map(do_output).map_err(|x| { let r: Result<Alias, _> = Err(x); r.unwrap(); () })
 	}
 
     ///
@@ -273,6 +281,7 @@ impl<KZG: Web3SumKZG> VerifiableUniqueAlias for BandersnatchRingVRF<KZG> {
 	}
 
 	fn create(
+		// Sergey TODO: This should be a borrow but ring-prover still consumes it.
 		(me, members): Self::Opening,
 		secret: &Self::Secret,
 		context: &[u8],
@@ -291,13 +300,13 @@ impl<KZG: Web3SumKZG> VerifiableUniqueAlias for BandersnatchRingVRF<KZG> {
 mod tests {
     use super::*;
     use core::iter;
+	use rand_core::{RngCore,OsRng};
 
     #[test]
 	fn create_trusted_setup() {
 		let domain_size = 2u32.pow(10);
 
-		let mut rng = &mut rand_core::OsRng;
-		use rand_core::RngCore;
+		let rng = &mut OsRng;
 		let mut seed = [0u8;32];
 		rng.fill_bytes(&mut seed);
 
@@ -312,6 +321,66 @@ mod tests {
 		kzg.serialize_compressed(&mut file).unwrap_or_else(|why| {
 			panic!("couldn't write {}: {}", path.display(), why);
 		});
+	}
+
+    fn random_bytes<const N: usize>() -> [u8; N] {
+		let mut entropy = [0u8; N];
+		OsRng.fill_bytes(&mut entropy);
+		entropy
+	}
+
+    type BRVRF = BandersnatchRingVRF<Test2e10>;
+	type Member = [u8; 33];
+
+	fn random_keypair() -> (Member,SecretKey) {
+		let secret = BRVRF::new_secret(& random_bytes());
+		(BRVRF::member_from_secret(&secret), secret)
+	}
+
+	fn random_ring() -> Vec<Member> {
+		let len = Test2e10::kzg().max_keyset_size();
+		// Sergey TODO:  Suppose arbitrary ring sizes below the bound by padding.
+		// let len = 2u16.pow(10);
+		// let len = u16::from_le_bytes(random_bytes()) % len;
+		let mut v = Vec::with_capacity(len as usize);
+		for _ in 0..len {
+			v.push(random_keypair().0);
+		}
+		v
+	}
+
+	#[test]
+	fn send_n_recieve() {
+		let (me,secret) = random_keypair();
+
+        // Random ring including me.
+		let mut ring = random_ring();
+		let idx = ring.len()/2;
+		ring[idx] = me;
+
+		let context = random_bytes::<32>();
+		let message = random_bytes::<1024>();
+
+        // Sign
+		let opening = BRVRF::open_members(&me,ring.iter()).unwrap();
+		let (signature,alias1) = BRVRF::create(opening,&secret,&context,&message).unwrap();
+
+        // TODO: serialize signature
+
+        // Verify
+		let mut inter = BRVRF::start_members();
+		for m in &ring {
+			BRVRF::push_member(&mut inter, m.clone()).unwrap();
+		}
+		assert_eq!(ring.len(), inter.0.len());
+		for (x,y) in ring.iter().zip(&inter.0) {
+			let mut z = [0u8;33];
+			y.serialize_compressed(&mut z[..]).unwrap();
+			assert_eq!(x,&z);
+		}
+		let members = BRVRF::finish_members(inter).unwrap();
+		let alias2 = signature.verify(&members,&context,&message).unwrap();
+		assert_eq!(alias1,alias2);
 	}
 }
 
