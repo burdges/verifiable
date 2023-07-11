@@ -337,10 +337,8 @@ mod tests {
 
 	fn random_ring() -> Vec<Member> {
 		let len = Test2e10::kzg().max_keyset_size();
-		// Sergey TODO:  Suppose arbitrary ring sizes below the bound by padding.
-		// let len = 2u16.pow(10);
-		// let len = u16::from_le_bytes(random_bytes()) % len;
-		let mut v = Vec::with_capacity(len as usize);
+		let len = usize::from_le_bytes(random_bytes()) % len;
+		let mut v = Vec::with_capacity(len);
 		for _ in 0..len {
 			v.push(random_keypair().0);
 		}
